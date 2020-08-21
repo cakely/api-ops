@@ -1,0 +1,71 @@
+on:
+  workflow_dispatch:
+
+name: Set up EKS cluster and ECR repo 
+
+env:
+  AWS_REGION: eu-west-1
+  ECR_REPOSITORY: cakely-registry
+
+jobs:
+  build:
+    runs-on: [self-hosted, eks-ecr-admin]
+    steps:
+    - uses: actions/checkout@v2
+
+    # The env context is not pre-populated with the self hosted runner's environment variables
+    # https://help.github.com/en/actions/reference/context-and-expression-syntax-for-github-actions#env-context
+    - name: Add masks for environment variables
+      run: |
+        echo "::add-mask::$ROLE_ID"
+        echo "::add-mask::$SECRET_ID"
+        
+    - name: Set environment variables
+      run: |
+        echo "::set-env name=ROLE_ID::$ROLE_ID"
+        echo "::set-env name=SECRET_ID::$SECRET_ID"
+      
+    # Import secrets from Vault
+    - name: Import Secrets
+      uses: hashicorp/vault-action@v1.0.1
+      id: secrets
+      with:
+        url: 'http://localhost:8200'    # Address of running Vault instance
+        method: approle
+        roleId: ${{ env.ROLE_ID }}
+        secretId: ${{ env.SECRET_ID }}
+        exportEnv: false
+        secrets: |
+          aws access_key | AWS_ACCESS_KEY_ID ;
+          aws secret_key | AWS_SECRET_ACCESS_KEY ;
+          github/eksctlDeployKey pat | PAT_FOR_DEPLOY_KEY
+
+    # Authenticate with AWS
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ steps.secrets.outputs.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ steps.secrets.outputs.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    # Download and install eksctl in lieu of a setup-eksctl action
+    - name: Install eksctl
+      run: |
+        curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /tmp
+        sudo mv /tmp/eksctl /usr/local/bin
+        eksctl version
+
+    # Create cluster according to definition in cluster.yaml
+    - name: eksctl create cluster
+      env:
+        GITHUB_TOKEN: ${{ steps.secrets.outputs.PAT_FOR_DEPLOY_KEY }}
+      run: eksctl create cluster -f cluster.yaml
+
+    # Create ECR repository with credentials retrieved above
+    - name: Create ECR repository
+      run: |
+        aws ecr create-repository \
+        --repository-name ${ECR_REPOSITORY} \
+        --image-tag-mutability IMMUTABLE \
+        --image-scanning-configuration scanOnPush=false \
+        --region ${AWS_REGION}
